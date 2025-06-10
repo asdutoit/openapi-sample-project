@@ -1,0 +1,378 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_environment:
+        description: 'Source environment to promote from'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+      deploy_reason:
+        description: 'Reason for deployment'
+        required: true
+        default: 'Production release'
+      approval_ticket:
+        description: 'Change management ticket number'
+        required: true
+        default: 'CHG-'
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: production
+  STACK_NAME: book-library-api-production
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate approval ticket
+        run: |
+          if [[ ! "${{ github.event.inputs.approval_ticket }}" =~ ^CHG-[0-9]+$ ]]; then
+            echo "Invalid ticket format. Must be CHG-XXXXX"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install validation tools
+        run: |
+          npm install -g @apidevtools/swagger-cli@4.0.4
+
+      - name: Validate OpenAPI spec
+        run: |
+          swagger-cli validate api/openapi.yaml
+
+  pre-deployment-checks:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials for Staging
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.STAGING_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.STAGING_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify staging deployment
+        run: |
+          # Check staging stack exists and is stable
+          STAGING_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name book-library-api-staging \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+          
+          if [[ "$STAGING_STATUS" != "CREATE_COMPLETE" && "$STAGING_STATUS" != "UPDATE_COMPLETE" ]]; then
+            echo "Staging stack is not in a stable state: $STAGING_STATUS"
+            exit 1
+          fi
+
+      - name: Get staging API endpoint
+        id: get-staging-api
+        run: |
+          STAGING_API_URL=$(aws cloudformation describe-stacks \
+            --stack-name book-library-api-staging \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          echo "STAGING_API_URL=$STAGING_API_URL" >> $GITHUB_OUTPUT
+
+      - name: Run production readiness tests
+        env:
+          API_ENDPOINT: ${{ steps.get-staging-api.outputs.STAGING_API_URL }}
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          echo "Running production readiness tests against staging..."
+          
+          # Test critical endpoints
+          ENDPOINTS=("/users" "/books")
+          for endpoint in "${ENDPOINTS[@]}"; do
+            echo "Testing $endpoint..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" "$API_ENDPOINT$endpoint?limit=1" \
+              -H "X-API-Key: $API_KEY" \
+              -H "Accept: application/json")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            if [[ "$HTTP_CODE" != "200" ]]; then
+              echo "Failed to get 200 response from $endpoint. Got: $HTTP_CODE"
+              exit 1
+            fi
+          done
+
+  deploy:
+    needs: pre-deployment-checks
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install AWS SAM CLI
+        run: |
+          pip install aws-sam-cli
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Lambda dependencies
+        run: |
+          cd src/layers/nodejs
+          npm ci --production
+          cd ../../..
+
+      - name: Create backup of current production
+        run: |
+          # Check if production stack exists
+          if aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} 2>/dev/null; then
+            echo "Creating backup of current production configuration..."
+            
+            # Export current stack template
+            aws cloudformation get-template \
+              --stack-name ${{ env.STACK_NAME }} \
+              --query 'TemplateBody' > production-backup-${{ github.run_id }}.json
+            
+            # Upload backup to S3
+            aws s3 cp production-backup-${{ github.run_id }}.json \
+              s3://${{ secrets.PROD_BACKUP_BUCKET }}/stack-backups/
+          fi
+
+      - name: Build SAM application
+        run: |
+          sam build \
+            --template-file infrastructure/template.yaml \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.PROD_API_KEY }}
+
+      - name: Deploy to AWS (Blue/Green)
+        run: |
+          # Deploy with blue/green strategy
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name ${{ env.STACK_NAME }} \
+            --s3-bucket ${{ secrets.PROD_SAM_DEPLOYMENT_BUCKET }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.PROD_API_KEY }} \
+              AllowedOrigins=${{ vars.PROD_ALLOWED_ORIGINS || 'https://booklibrary.com,https://www.booklibrary.com' }} \
+              RateLimitPerMinute=${{ vars.PROD_RATE_LIMIT || '1000' }} \
+              EnableWAF=true \
+              EnableCustomDomain=true \
+              CustomDomainName=${{ vars.PROD_CUSTOM_DOMAIN || 'api.booklibrary.com' }} \
+              CertificateArn=${{ secrets.PROD_CERTIFICATE_ARN }} \
+              EnableXRay=true \
+              ReservedConcurrentExecutions=${{ vars.PROD_LAMBDA_RESERVED_CONCURRENCY || '100' }} \
+              ProvisionedConcurrentExecutions=${{ vars.PROD_LAMBDA_PROVISIONED_CONCURRENCY || '10' }}
+
+      - name: Get API endpoints
+        id: get-api-urls
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          echo "API_URL=$API_URL" >> $GITHUB_OUTPUT
+          
+          CUSTOM_DOMAIN=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`CustomDomainUrl`].OutputValue' \
+            --output text)
+          echo "CUSTOM_DOMAIN=$CUSTOM_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Upload OpenAPI spec and documentation
+        run: |
+          DOCS_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`DocumentationBucket`].OutputValue' \
+            --output text)
+          
+          if [ ! -z "$DOCS_BUCKET" ]; then
+            # Upload versioned OpenAPI spec
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/openapi.yaml
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/versions/openapi-${{ github.sha }}.yaml
+            
+            # Generate and upload API documentation
+            npx @redocly/cli build-docs api/openapi.yaml -o api-docs.html
+            aws s3 cp api-docs.html s3://$DOCS_BUCKET/index.html
+            
+            # Set cache headers
+            aws s3 cp s3://$DOCS_BUCKET/index.html s3://$DOCS_BUCKET/index.html \
+              --metadata-directive REPLACE \
+              --cache-control "public, max-age=3600"
+          fi
+
+      - name: Run production smoke tests
+        env:
+          API_ENDPOINT: ${{ steps.get-api-urls.outputs.CUSTOM_DOMAIN || steps.get-api-urls.outputs.API_URL }}
+          API_KEY: ${{ secrets.PROD_API_KEY }}
+        run: |
+          echo "Running production smoke tests..."
+          
+          # Allow time for deployment to stabilize
+          sleep 30
+          
+          # Test all critical endpoints
+          ENDPOINTS=("/users" "/books")
+          for endpoint in "${ENDPOINTS[@]}"; do
+            echo "Testing $endpoint..."
+            for i in {1..3}; do
+              RESPONSE=$(curl -s -w "\n%{http_code}" "https://$API_ENDPOINT$endpoint?limit=1" \
+                -H "X-API-Key: $API_KEY" \
+                -H "Accept: application/json")
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+              if [[ "$HTTP_CODE" == "200" ]]; then
+                echo "✓ $endpoint is healthy"
+                break
+              else
+                echo "✗ Attempt $i failed for $endpoint. Got: $HTTP_CODE"
+                if [[ $i -eq 3 ]]; then
+                  echo "Failed after 3 attempts"
+                  exit 1
+                fi
+                sleep 10
+              fi
+            done
+          done
+
+      - name: Update Route53 health checks
+        run: |
+          # Update health check for custom domain if configured
+          if [ ! -z "${{ vars.PROD_HEALTH_CHECK_ID }}" ]; then
+            aws route53 update-health-check \
+              --health-check-id ${{ vars.PROD_HEALTH_CHECK_ID }} \
+              --health-check-config \
+                IPAddress=${{ steps.get-api-urls.outputs.API_URL }} \
+                ResourcePath="/health"
+          fi
+
+      - name: Enable CloudWatch alarms
+        run: |
+          # Enable production monitoring alarms
+          ALARM_NAMES=(
+            "${{ env.STACK_NAME }}-4XXErrors"
+            "${{ env.STACK_NAME }}-5XXErrors"
+            "${{ env.STACK_NAME }}-HighLatency"
+            "${{ env.STACK_NAME }}-ThrottledRequests"
+          )
+          
+          for alarm in "${ALARM_NAMES[@]}"; do
+            aws cloudwatch enable-alarm-actions --alarm-names "$alarm" || true
+          done
+
+      - name: Create deployment record
+        run: |
+          # Record deployment in DynamoDB
+          aws dynamodb put-item \
+            --table-name deployments-tracking \
+            --item '{
+              "deployment_id": {"S": "'${{ github.run_id }}'"},
+              "environment": {"S": "'${{ env.ENVIRONMENT }}'"},
+              "timestamp": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+              "commit_sha": {"S": "'${{ github.sha }}'"},
+              "deployed_by": {"S": "'${{ github.actor }}'"},
+              "api_endpoint": {"S": "'${{ steps.get-api-urls.outputs.API_URL }}'"},
+              "custom_domain": {"S": "'${{ steps.get-api-urls.outputs.CUSTOM_DOMAIN }}'"},
+              "approval_ticket": {"S": "'${{ github.event.inputs.approval_ticket }}'"},
+              "status": {"S": "success"}
+            }'
+
+      - name: Create rollback plan
+        run: |
+          # Create automated rollback script
+          cat > rollback-${{ github.run_id }}.sh << 'EOF'
+          #!/bin/bash
+          echo "Rolling back production deployment ${{ github.run_id }}"
+          
+          # Restore from backup
+          aws s3 cp s3://${{ secrets.PROD_BACKUP_BUCKET }}/stack-backups/production-backup-${{ github.run_id }}.json ./backup.json
+          
+          # Deploy backup template
+          aws cloudformation update-stack \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-body file://backup.json \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
+          
+          echo "Rollback initiated. Monitor CloudFormation console for progress."
+          EOF
+          
+          # Upload rollback script
+          aws s3 cp rollback-${{ github.run_id }}.sh \
+            s3://${{ secrets.PROD_BACKUP_BUCKET }}/rollback-scripts/
+
+      - name: Send deployment notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Production Deployment ${{ job.status }}
+            Environment: ${{ env.ENVIRONMENT }}
+            Promoted from: ${{ github.event.inputs.source_environment }}
+            Approval Ticket: ${{ github.event.inputs.approval_ticket }}
+            Reason: ${{ github.event.inputs.deploy_reason }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+            API URL: https://${{ steps.get-api-urls.outputs.CUSTOM_DOMAIN || steps.get-api-urls.outputs.API_URL }}
+            Rollback Script: s3://${{ secrets.PROD_BACKUP_BUCKET }}/rollback-scripts/rollback-${{ github.run_id }}.sh
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  post-deployment-monitoring:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Monitor deployment health
+        run: |
+          echo "Monitoring production deployment for 5 minutes..."
+          
+          # Monitor CloudWatch metrics for 5 minutes
+          END_TIME=$(($(date +%s) + 300))
+          
+          while [ $(date +%s) -lt $END_TIME ]; do
+            # Check for any CloudWatch alarms in ALARM state
+            ALARMS=$(aws cloudwatch describe-alarms \
+              --alarm-name-prefix "${{ env.STACK_NAME }}" \
+              --state-value ALARM \
+              --query 'MetricAlarms[].AlarmName' \
+              --output text)
+            
+            if [ ! -z "$ALARMS" ]; then
+              echo "⚠️  Production alarms triggered: $ALARMS"
+              echo "Consider rolling back deployment"
+              exit 1
+            fi
+            
+            echo "✓ No alarms triggered. Waiting 30 seconds..."
+            sleep 30
+          done
+          
+          echo "✅ Production deployment stable after 5 minutes"

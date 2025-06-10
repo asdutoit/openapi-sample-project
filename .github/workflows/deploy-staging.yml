@@ -1,0 +1,238 @@
+name: Deploy to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_environment:
+        description: 'Source environment to promote from'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+      deploy_reason:
+        description: 'Reason for deployment'
+        required: true
+        default: 'Promotion from development'
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: staging
+  STACK_NAME: book-library-api-staging
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install validation tools
+        run: |
+          npm install -g @apidevtools/swagger-cli@4.0.4
+
+      - name: Validate OpenAPI spec
+        run: |
+          swagger-cli validate api/openapi.yaml
+
+  integration-tests:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Configure AWS credentials for Dev
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Dev API endpoint
+        id: get-dev-api
+        run: |
+          DEV_API_URL=$(aws cloudformation describe-stacks \
+            --stack-name book-library-api-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          echo "DEV_API_URL=$DEV_API_URL" >> $GITHUB_OUTPUT
+
+      - name: Run integration tests against Dev
+        env:
+          API_ENDPOINT: ${{ steps.get-dev-api.outputs.DEV_API_URL }}
+          API_KEY: ${{ secrets.DEV_API_KEY }}
+        run: |
+          # Add comprehensive integration tests here
+          echo "Running integration tests against development environment..."
+          
+          # Test user creation
+          USER_RESPONSE=$(curl -s -X POST "$API_ENDPOINT/users" \
+            -H "X-API-Key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"email":"test@example.com","name":"Test User","password":"TestPass123!"}')
+          
+          # Verify response
+          echo "$USER_RESPONSE" | jq -e '.id' || exit 1
+
+  deploy:
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install AWS SAM CLI
+        run: |
+          pip install aws-sam-cli
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.STAGING_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.STAGING_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Lambda dependencies
+        run: |
+          cd src/layers/nodejs
+          npm ci --production
+          cd ../../..
+
+      - name: Build SAM application
+        run: |
+          sam build \
+            --template-file infrastructure/template.yaml \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.STAGING_API_KEY }}
+
+      - name: Deploy to AWS
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name ${{ env.STACK_NAME }} \
+            --s3-bucket ${{ secrets.STAGING_SAM_DEPLOYMENT_BUCKET }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.STAGING_API_KEY }} \
+              AllowedOrigins=${{ vars.STAGING_ALLOWED_ORIGINS || 'https://*.staging.booklibrary.com' }} \
+              RateLimitPerMinute=${{ vars.STAGING_RATE_LIMIT || '200' }} \
+              EnableWAF=true \
+              EnableCustomDomain=${{ vars.STAGING_ENABLE_CUSTOM_DOMAIN || 'false' }} \
+              CustomDomainName=${{ vars.STAGING_CUSTOM_DOMAIN || '' }} \
+              CertificateArn=${{ secrets.STAGING_CERTIFICATE_ARN || '' }}
+
+      - name: Get API endpoint
+        id: get-api-url
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          echo "API_URL=$API_URL" >> $GITHUB_OUTPUT
+          echo "API deployed to: $API_URL"
+
+      - name: Upload OpenAPI spec to S3
+        run: |
+          DOCS_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`DocumentationBucket`].OutputValue' \
+            --output text)
+          
+          if [ ! -z "$DOCS_BUCKET" ]; then
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/openapi.yaml
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/openapi-${{ github.sha }}.yaml
+            
+            # Generate and upload API documentation
+            npx @redocly/cli build-docs api/openapi.yaml -o api-docs.html
+            aws s3 cp api-docs.html s3://$DOCS_BUCKET/index.html
+          fi
+
+      - name: Run smoke tests
+        env:
+          API_ENDPOINT: ${{ steps.get-api-url.outputs.API_URL }}
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          # Comprehensive smoke tests
+          echo "Running smoke tests..."
+          
+          # Test users endpoint
+          curl -f -X GET "$API_ENDPOINT/users?limit=1" \
+            -H "X-API-Key: $API_KEY" \
+            -H "Accept: application/json" || exit 1
+          
+          # Test books endpoint
+          curl -f -X GET "$API_ENDPOINT/books?limit=1" \
+            -H "X-API-Key: $API_KEY" \
+            -H "Accept: application/json" || exit 1
+
+      - name: Run performance tests
+        env:
+          API_ENDPOINT: ${{ steps.get-api-url.outputs.API_URL }}
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          # Basic performance test
+          echo "Running basic performance test..."
+          
+          # Install Apache Bench if not available
+          sudo apt-get update && sudo apt-get install -y apache2-utils
+          
+          # Run performance test (100 requests, 10 concurrent)
+          ab -n 100 -c 10 -H "X-API-Key: $API_KEY" "$API_ENDPOINT/users?limit=10" || true
+
+      - name: Create deployment record
+        run: |
+          # Create a deployment record in DynamoDB or S3
+          aws dynamodb put-item \
+            --table-name deployments-tracking \
+            --item '{
+              "deployment_id": {"S": "'${{ github.run_id }}'"},
+              "environment": {"S": "'${{ env.ENVIRONMENT }}'"},
+              "timestamp": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+              "commit_sha": {"S": "'${{ github.sha }}'"},
+              "deployed_by": {"S": "'${{ github.actor }}'"},
+              "api_endpoint": {"S": "'${{ steps.get-api-url.outputs.API_URL }}'"},
+              "status": {"S": "success"}
+            }' || true
+
+      - name: Send deployment notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Staging Deployment ${{ job.status }}
+            Environment: ${{ env.ENVIRONMENT }}
+            Promoted from: ${{ github.event.inputs.source_environment }}
+            Reason: ${{ github.event.inputs.deploy_reason }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+            API URL: ${{ steps.get-api-url.outputs.API_URL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

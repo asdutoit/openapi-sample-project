@@ -1,0 +1,22 @@
+{
+  "name": "book-library-api-dependencies",
+  "version": "1.0.0",
+  "description": "Common dependencies for Book Library API Lambda functions",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1500.0",
+    "bcryptjs": "^2.4.3",
+    "uuid": "^9.0.1"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "dynamodb",
+    "api"
+  ],
+  "author": "Book Library API Team",
+  "license": "MIT"
+}

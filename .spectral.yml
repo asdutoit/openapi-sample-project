@@ -1,0 +1,137 @@
+extends: ["spectral:oas"]
+
+rules:
+  # API Design Rules
+  operation-success-response: error
+  operation-operationId: error
+  operation-description: warn
+  operation-tags: warn
+  info-contact: error
+  info-description: warn
+  info-license: warn
+  no-$ref-siblings: error
+  oas3-api-servers: error
+  openapi-tags: warn
+  operation-tag-defined: error
+  
+  # Security Rules
+  oas3-schema: error
+  oas3-valid-media-example: error
+  oas3-valid-schema-example: error
+  
+  # Custom Rules
+  no-trailing-slash:
+    description: "Paths should not have trailing slashes"
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: "/$"
+    severity: warn
+  
+  require-api-version:
+    description: "API must have a version"
+    given: "$.info"
+    then:
+      field: version
+      function: truthy
+    severity: error
+
+  require-operation-summary:
+    description: "Operation must have a summary"
+    given: "$.paths[*][*]"
+    then:
+      field: summary
+      function: truthy
+    severity: warn
+
+  require-schema-examples:
+    description: "Schema should have examples"
+    given: "$.components.schemas[*]"
+    then:
+      field: example
+      function: defined
+    severity: info
+
+  consistent-response-body:
+    description: "Error responses should have consistent schema"
+    given: "$.paths[*][*].responses[4*,5*].content.application/json.schema"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          required: ["error", "message", "timestamp"]
+          properties:
+            error:
+              type: string
+            message:
+              type: string
+            timestamp:
+              type: string
+              format: date-time
+    severity: warn
+
+  require-rate-limit-headers:
+    description: "Responses should include rate limit headers"
+    given: "$.paths[*][*].responses.200.headers"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          anyOf:
+            - required: ["X-RateLimit-Limit"]
+            - required: ["X-RateLimit-Remaining"]
+            - required: ["X-RateLimit-Reset"]
+    severity: info
+
+  pagination-consistency:
+    description: "List endpoints should have consistent pagination parameters"
+    given: "$.paths[*].get.parameters[*]"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          if:
+            properties:
+              name:
+                enum: ["page", "limit"]
+          then:
+            properties:
+              schema:
+                type: object
+                properties:
+                  type:
+                    const: integer
+                  minimum:
+                    const: 1
+    severity: warn
+
+  security-scheme-defined:
+    description: "Security schemes should be properly defined"
+    given: "$.components.securitySchemes[*]"
+    then:
+      function: truthy
+    severity: error
+
+  response-status-codes:
+    description: "Common status codes should be documented"
+    given: "$.paths[*][*].responses"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          anyOf:
+            - required: ["200"]
+            - required: ["201"]
+            - required: ["204"]
+          properties:
+            "400":
+              type: object
+            "401":
+              type: object
+            "500":
+              type: object
+    severity: info

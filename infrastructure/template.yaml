@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Book Library Management API - SAM Template
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, production]
+    Description: Deployment environment
+  
+  ApiKeyValue:
+    Type: String
+    NoEcho: true
+    Description: API Key for authentication
+    MinLength: 32
+  
+  AllowedOrigins:
+    Type: String
+    Default: '*'
+    Description: CORS allowed origins (comma-separated)
+  
+  RateLimitPerMinute:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+    Description: API rate limit per minute
+  
+  EnableWAF:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS WAF for API protection
+  
+  EnableCustomDomain:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable custom domain for API
+  
+  CustomDomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain name (e.g., api.booklibrary.com)
+  
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for custom domain
+  
+  EnableXRay:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS X-Ray tracing
+  
+  ReservedConcurrentExecutions:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+    Description: Reserved concurrent executions for Lambda functions (0 = unreserved)
+  
+  ProvisionedConcurrentExecutions:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+    Description: Provisioned concurrent executions for Lambda functions
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableWAFCondition: !Equals [!Ref EnableWAF, 'true']
+  EnableCustomDomainCondition: !Equals [!Ref EnableCustomDomain, 'true']
+  EnableXRayCondition: !Equals [!Ref EnableXRay, 'true']
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrentExecutions, 0]]
+  HasProvisionedConcurrency: !Not [!Equals [!Ref ProvisionedConcurrentExecutions, 0]]
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        USERS_TABLE: !Ref UsersTable
+        BOOKS_TABLE: !Ref BooksTable
+        BORROWING_TABLE: !Ref BorrowingTable
+        API_KEY_PARAMETER: !Ref ApiKeyParameter
+    Layers:
+      - !Ref DependenciesLayer
+    Tracing: !If [EnableXRayCondition, Active, PassThrough]
+    ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrentExecutions, !Ref AWS::NoValue]
+
+Resources:
+  # API Gateway
+  BookLibraryApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: !Ref Environment
+      OpenApiVersion: '3.0.3'
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: ../api/openapi.yaml
+      Cors:
+        AllowOrigin: !Ref AllowedOrigins
+        AllowHeaders: "'Content-Type,X-API-Key,Authorization'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        MaxAge: 3600
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: !Sub Usage plan for ${AWS::StackName}
+          Quota:
+            Limit: 100000
+            Period: MONTH
+          Throttle:
+            BurstLimit: !Ref RateLimitPerMinute
+            RateLimit: !Ref RateLimitPerMinute
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, ERROR, INFO]
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: !Ref RateLimitPerMinute
+          ThrottlingRateLimit: !Ref RateLimitPerMinute
+      TracingEnabled: !If [EnableXRayCondition, true, false]
+      Tags:
+        Environment: !Ref Environment
+        Service: BookLibraryAPI
+
+  # API Key Parameter Store
+  ApiKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/api-key
+      Type: String
+      Value: !Ref ApiKeyValue
+      Description: API Key for Book Library API
+      Tags:
+        Environment: !Ref Environment
+
+  # Lambda Layer for Dependencies
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-dependencies
+      Description: Common dependencies for Lambda functions
+      ContentUri: ../src/layers/
+      CompatibleRuntimes:
+        - nodejs18.x
+      RetentionPolicy: Delete
+
+  # Lambda Functions
+  ListUsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-list-users
+      Handler: users.listUsers
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /users
+            Method: GET
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+      ProvisionedConcurrencyConfig: !If
+        - HasProvisionedConcurrency
+        - ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrentExecutions
+        - !Ref AWS::NoValue
+
+  CreateUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-user
+      Handler: users.createUser
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /users
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+
+  GetUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get-user
+      Handler: users.getUser
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /users/{userId}
+            Method: GET
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BorrowingTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+
+  ListBooksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-list-books
+      Handler: books.listBooks
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /books
+            Method: GET
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref BooksTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+      ProvisionedConcurrencyConfig: !If
+        - HasProvisionedConcurrency
+        - ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrentExecutions
+        - !Ref AWS::NoValue
+
+  CreateBookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-book
+      Handler: books.createBook
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /books
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BooksTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+
+  BorrowBookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-borrow-book
+      Handler: books.borrowBook
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /books/{bookId}/borrow
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BooksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BorrowingTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+
+  ReturnBookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-return-book
+      Handler: books.returnBook
+      CodeUri: ../src/handlers/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BookLibraryApi
+            Path: /books/{bookId}/return
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BooksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BorrowingTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/api-key
+
+  # DynamoDB Tables
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-users
+      BillingMode: !If [IsProduction, PROVISIONED, PAY_PER_REQUEST]
+      ProvisionedThroughput: !If
+        - IsProduction
+        - ReadCapacityUnits: 10
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 2
+            - !Ref AWS::NoValue
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  BooksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-books
+      BillingMode: !If [IsProduction, PROVISIONED, PAY_PER_REQUEST]
+      ProvisionedThroughput: !If
+        - IsProduction
+        - ReadCapacityUnits: 10
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: isbn
+          AttributeType: S
+        - AttributeName: genre
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ISBNIndex
+          KeySchema:
+            - AttributeName: isbn
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 2
+            - !Ref AWS::NoValue
+        - IndexName: GenreIndex
+          KeySchema:
+            - AttributeName: genre
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 2
+            - !Ref AWS::NoValue
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  BorrowingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-borrowing
+      BillingMode: !If [IsProduction, PROVISIONED, PAY_PER_REQUEST]
+      ProvisionedThroughput: !If
+        - IsProduction
+        - ReadCapacityUnits: 10
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: bookId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 2
+            - !Ref AWS::NoValue
+        - IndexName: BookIndex
+          KeySchema:
+            - AttributeName: bookId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 2
+            - !Ref AWS::NoValue
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for Documentation
+  DocumentationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-docs-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  APIGateway4XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-4XXErrors
+      AlarmDescription: Alert on high 4XX error rate
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub ${AWS::StackName}-api
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  APIGateway5XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-5XXErrors
+      AlarmDescription: Alert on any 5XX errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub ${AWS::StackName}-api
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  APIGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-HighLatency
+      AlarmDescription: Alert on high API latency
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub ${AWS::StackName}-api
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  # WAF (Conditional)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: EnableWAFCondition
+    Properties:
+      Name: !Sub ${AWS::StackName}-waf
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerMinute
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+        - Name: CommonAttackProtection
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonAttackProtection
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-waf
+
+  # Associate WAF with API Gateway
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: EnableWAFCondition
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${BookLibraryApi}/stages/${Environment}
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # Custom Domain (Conditional)
+  CustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Condition: EnableCustomDomainCondition
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RegionalCertificateArn: !Ref CertificateArn
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      SecurityPolicy: TLS_1_2
+
+  BasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: EnableCustomDomainCondition
+    Properties:
+      DomainName: !Ref CustomDomain
+      RestApiId: !Ref BookLibraryApi
+      Stage: !Ref Environment
+
+  # Deployment Tracking Table
+  DeploymentTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsProduction
+    Properties:
+      TableName: deployments-tracking
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deployment_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: deployment_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Purpose
+          Value: DeploymentTracking
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${BookLibraryApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  CustomDomainUrl:
+    Condition: EnableCustomDomainCondition
+    Description: Custom domain URL
+    Value: !Sub https://${CustomDomainName}
+    Export:
+      Name: !Sub ${AWS::StackName}-CustomDomainUrl
+
+  DocumentationBucket:
+    Description: S3 bucket for API documentation
+    Value: !Ref DocumentationBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentationBucket
+
+  ApiKeyParameterName:
+    Description: SSM Parameter name for API key
+    Value: !Ref ApiKeyParameter
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiKeyParameter
+
+  UsersTableName:
+    Description: DynamoDB table name for users
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub ${AWS::StackName}-UsersTable
+
+  BooksTableName:
+    Description: DynamoDB table name for books
+    Value: !Ref BooksTable
+    Export:
+      Name: !Sub ${AWS::StackName}-BooksTable
+
+  BorrowingTableName:
+    Description: DynamoDB table name for borrowing records
+    Value: !Ref BorrowingTable
+    Export:
+      Name: !Sub ${AWS::StackName}-BorrowingTable
+
+  StackId:
+    Description: CloudFormation Stack ID
+    Value: !Ref AWS::StackId
+
+  Region:
+    Description: AWS Region
+    Value: !Ref AWS::Region

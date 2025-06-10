@@ -1,0 +1,150 @@
+name: Validate OpenAPI Specification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'api/openapi.yaml'
+      - '.github/workflows/validate-api.yml'
+  push:
+    branches:
+      - 'feature/**'
+      - 'fix/**'
+      - 'hotfix/**'
+    paths:
+      - 'api/openapi.yaml'
+
+jobs:
+  validate-openapi:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for breaking change detection
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install validation tools
+        run: |
+          npm install -g @stoplight/spectral-cli@6.11.0
+          npm install -g @apidevtools/swagger-cli@4.0.4
+          npm install -g @openapitools/openapi-generator-cli@2.7.0
+          npm install -g oasdiff@1.10.5
+
+      - name: Validate OpenAPI syntax
+        run: |
+          echo "Validating OpenAPI specification syntax..."
+          swagger-cli validate api/openapi.yaml
+
+      - name: Lint OpenAPI specification
+        run: |
+          echo "Linting OpenAPI specification..."
+          spectral lint api/openapi.yaml --ruleset .spectral.yml || true
+
+      - name: Generate Spectral ruleset if missing
+        run: |
+          if [ ! -f .spectral.yml ]; then
+            echo "Creating default Spectral ruleset..."
+            cat > .spectral.yml << 'EOF'
+extends: ["spectral:oas", "spectral:asyncapi"]
+rules:
+  operation-success-response: error
+  operation-operationId: error
+  operation-description: warn
+  operation-tags: warn
+  info-contact: error
+  info-description: warn
+  info-license: warn
+  no-$ref-siblings: error
+  oas3-api-servers: error
+  openapi-tags: warn
+  operation-tag-defined: error
+EOF
+          fi
+
+      - name: Run security linting
+        run: |
+          echo "Running security checks..."
+          spectral lint api/openapi.yaml --ruleset https://raw.githubusercontent.com/stoplightio/spectral-owasp-ruleset/main/ruleset.yml || true
+
+      - name: Check for breaking changes
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Checking for breaking changes..."
+          # Try to get the previous version from main branch
+          git show origin/main:api/openapi.yaml > /tmp/openapi-main.yaml 2>/dev/null || echo "No previous version found"
+          
+          if [ -f /tmp/openapi-main.yaml ]; then
+            oasdiff breaking /tmp/openapi-main.yaml api/openapi.yaml || {
+              echo "::warning::Breaking changes detected in OpenAPI specification"
+              exit 0  # Don't fail the build, just warn
+            }
+          else
+            echo "No previous OpenAPI spec found for comparison"
+          fi
+
+      - name: Validate examples
+        run: |
+          echo "Validating OpenAPI examples..."
+          openapi-generator-cli validate -i api/openapi.yaml
+
+      - name: Generate validation report
+        if: always()
+        run: |
+          echo "# OpenAPI Validation Report" > validation-report.md
+          echo "## Specification: api/openapi.yaml" >> validation-report.md
+          echo "### Validation Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> validation-report.md
+          echo "" >> validation-report.md
+          
+          echo "### Syntax Validation" >> validation-report.md
+          swagger-cli validate api/openapi.yaml --type json > syntax-validation.json 2>&1 || true
+          echo '```json' >> validation-report.md
+          cat syntax-validation.json >> validation-report.md
+          echo '```' >> validation-report.md
+          echo "" >> validation-report.md
+          
+          echo "### Linting Results" >> validation-report.md
+          spectral lint api/openapi.yaml --format json > linting-results.json 2>&1 || true
+          echo '```json' >> validation-report.md
+          cat linting-results.json >> validation-report.md
+          echo '```' >> validation-report.md
+          echo "" >> validation-report.md
+          
+          echo "### API Statistics" >> validation-report.md
+          echo "- Total Endpoints: $(grep -c "^ \{2,4\}/" api/openapi.yaml || echo 0)" >> validation-report.md
+          echo "- Total Schemas: $(grep -c "^ \{4\}[a-zA-Z].*:$" api/openapi.yaml | grep -A1 schemas || echo 0)" >> validation-report.md
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: openapi-validation-report
+          path: |
+            validation-report.md
+            syntax-validation.json
+            linting-results.json
+
+      - name: Comment PR with validation results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('validation-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+      - name: Check validation status
+        run: |
+          echo "OpenAPI validation completed successfully!"

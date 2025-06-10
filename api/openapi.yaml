@@ -1,0 +1,891 @@
+openapi: 3.0.3
+info:
+  title: Book Library Management API
+  version: 1.0.0
+  description: |
+    A comprehensive API for managing a book library system including book inventory,
+    user management, and borrowing/returning functionality.
+  contact:
+    name: API Support Team
+    email: api-support@booklibrary.com
+    url: https://booklibrary.com/support
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api-dev.booklibrary.com
+    description: Development server
+  - url: https://api-staging.booklibrary.com
+    description: Staging server
+  - url: https://api.booklibrary.com
+    description: Production server
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: users
+    description: User management operations
+  - name: books
+    description: Book inventory operations
+  - name: borrowing
+    description: Book borrowing and returning operations
+
+paths:
+  /users:
+    get:
+      tags:
+        - users
+      summary: List all users
+      description: Retrieve a paginated list of all users in the system
+      operationId: listUsers
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: search
+          in: query
+          description: Search users by name or email
+          required: false
+          schema:
+            type: string
+            example: john
+      responses:
+        '200':
+          description: Successful response
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+              example:
+                users:
+                  - id: "usr_123456"
+                    email: "john.doe@example.com"
+                    name: "John Doe"
+                    membershipStatus: "active"
+                    borrowingLimit: 5
+                    currentBorrowedCount: 2
+                    createdAt: "2023-01-15T10:30:00Z"
+                    updatedAt: "2023-11-20T14:22:00Z"
+                  - id: "usr_789012"
+                    email: "jane.smith@example.com"
+                    name: "Jane Smith"
+                    membershipStatus: "active"
+                    borrowingLimit: 5
+                    currentBorrowedCount: 0
+                    createdAt: "2023-02-20T09:15:00Z"
+                    updatedAt: "2023-11-19T11:45:00Z"
+                pagination:
+                  page: 1
+                  limit: 20
+                  totalPages: 5
+                  totalItems: 98
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - users
+      summary: Create a new user
+      description: Register a new user in the library system
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+            example:
+              email: "newuser@example.com"
+              name: "New User"
+              password: "SecurePass123!"
+              phoneNumber: "+1234567890"
+      responses:
+        '201':
+          description: User created successfully
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              example:
+                id: "usr_345678"
+                email: "newuser@example.com"
+                name: "New User"
+                membershipStatus: "active"
+                borrowingLimit: 5
+                currentBorrowedCount: 0
+                createdAt: "2023-11-21T15:30:00Z"
+                updatedAt: "2023-11-21T15:30:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          description: User already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "CONFLICT"
+                message: "A user with this email already exists"
+                timestamp: "2023-11-21T15:30:00Z"
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /users/{userId}:
+    get:
+      tags:
+        - users
+      summary: Get user by ID
+      description: Retrieve detailed information about a specific user
+      operationId: getUserById
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          description: The ID of the user to retrieve
+          schema:
+            type: string
+            pattern: '^usr_[a-zA-Z0-9]{6}$'
+            example: usr_123456
+      responses:
+        '200':
+          description: Successful response
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+              example:
+                id: "usr_123456"
+                email: "john.doe@example.com"
+                name: "John Doe"
+                phoneNumber: "+1234567890"
+                membershipStatus: "active"
+                borrowingLimit: 5
+                currentBorrowedCount: 2
+                createdAt: "2023-01-15T10:30:00Z"
+                updatedAt: "2023-11-20T14:22:00Z"
+                borrowedBooks:
+                  - bookId: "bk_987654"
+                    title: "The Great Gatsby"
+                    borrowedAt: "2023-11-15T10:00:00Z"
+                    dueDate: "2023-11-29T10:00:00Z"
+                  - bookId: "bk_876543"
+                    title: "1984"
+                    borrowedAt: "2023-11-18T14:30:00Z"
+                    dueDate: "2023-12-02T14:30:00Z"
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /books:
+    get:
+      tags:
+        - books
+      summary: List all books
+      description: Retrieve a paginated list of all books in the library
+      operationId: listBooks
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: search
+          in: query
+          description: Search books by title, author, or ISBN
+          required: false
+          schema:
+            type: string
+            example: gatsby
+        - name: genre
+          in: query
+          description: Filter by genre
+          required: false
+          schema:
+            type: string
+            enum: [fiction, non-fiction, science, history, biography, children]
+        - name: available
+          in: query
+          description: Filter by availability status
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Successful response
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  books:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Book'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+              example:
+                books:
+                  - id: "bk_987654"
+                    isbn: "978-0-7432-7356-5"
+                    title: "The Great Gatsby"
+                    author: "F. Scott Fitzgerald"
+                    genre: "fiction"
+                    publicationYear: 1925
+                    available: false
+                    totalCopies: 5
+                    availableCopies: 0
+                  - id: "bk_876543"
+                    isbn: "978-0-452-28423-4"
+                    title: "1984"
+                    author: "George Orwell"
+                    genre: "fiction"
+                    publicationYear: 1949
+                    available: true
+                    totalCopies: 8
+                    availableCopies: 3
+                pagination:
+                  page: 1
+                  limit: 20
+                  totalPages: 25
+                  totalItems: 487
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - books
+      summary: Add a new book
+      description: Add a new book to the library inventory
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookRequest'
+            example:
+              isbn: "978-0-316-76948-0"
+              title: "The Catcher in the Rye"
+              author: "J.D. Salinger"
+              genre: "fiction"
+              publicationYear: 1951
+              publisher: "Little, Brown and Company"
+              totalCopies: 3
+      responses:
+        '201':
+          description: Book created successfully
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+              example:
+                id: "bk_456789"
+                isbn: "978-0-316-76948-0"
+                title: "The Catcher in the Rye"
+                author: "J.D. Salinger"
+                genre: "fiction"
+                publicationYear: 1951
+                publisher: "Little, Brown and Company"
+                available: true
+                totalCopies: 3
+                availableCopies: 3
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          description: Book already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "CONFLICT"
+                message: "A book with this ISBN already exists"
+                timestamp: "2023-11-21T15:30:00Z"
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /books/{bookId}/borrow:
+    post:
+      tags:
+        - borrowing
+      summary: Borrow a book
+      description: Borrow a book from the library
+      operationId: borrowBook
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          description: The ID of the book to borrow
+          schema:
+            type: string
+            pattern: '^bk_[a-zA-Z0-9]{6}$'
+            example: bk_987654
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BorrowBookRequest'
+            example:
+              userId: "usr_123456"
+              durationDays: 14
+      responses:
+        '200':
+          description: Book borrowed successfully
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BorrowingRecord'
+              example:
+                id: "brw_789456"
+                userId: "usr_123456"
+                bookId: "bk_987654"
+                borrowedAt: "2023-11-21T16:00:00Z"
+                dueDate: "2023-12-05T16:00:00Z"
+                status: "active"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          description: Book not available or user limit reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "CONFLICT"
+                message: "This book is not available for borrowing"
+                timestamp: "2023-11-21T16:00:00Z"
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /books/{bookId}/return:
+    post:
+      tags:
+        - borrowing
+      summary: Return a book
+      description: Return a borrowed book to the library
+      operationId: returnBook
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          description: The ID of the book to return
+          schema:
+            type: string
+            pattern: '^bk_[a-zA-Z0-9]{6}$'
+            example: bk_987654
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnBookRequest'
+            example:
+              userId: "usr_123456"
+      responses:
+        '200':
+          description: Book returned successfully
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/RateLimitReset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BorrowingRecord'
+              example:
+                id: "brw_789456"
+                userId: "usr_123456"
+                bookId: "bk_987654"
+                borrowedAt: "2023-11-07T16:00:00Z"
+                dueDate: "2023-11-21T16:00:00Z"
+                returnedAt: "2023-11-21T10:30:00Z"
+                status: "returned"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication
+
+  headers:
+    RateLimitLimit:
+      description: The number of allowed requests in the current period
+      schema:
+        type: integer
+        example: 100
+    RateLimitRemaining:
+      description: The number of remaining requests in the current period
+      schema:
+        type: integer
+        example: 95
+    RateLimitReset:
+      description: The time at which the current rate limit window resets in UTC epoch seconds
+      schema:
+        type: integer
+        example: 1700593200
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      description: Page number for pagination
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+        example: 1
+    LimitParam:
+      name: limit
+      in: query
+      description: Number of items per page
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+        example: 20
+
+  schemas:
+    User:
+      type: object
+      required:
+        - id
+        - email
+        - name
+        - membershipStatus
+        - borrowingLimit
+        - currentBorrowedCount
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^usr_[a-zA-Z0-9]{6}$'
+          description: Unique user identifier
+        email:
+          type: string
+          format: email
+          description: User's email address
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: User's full name
+        membershipStatus:
+          type: string
+          enum: [active, suspended, expired]
+          description: Current membership status
+        borrowingLimit:
+          type: integer
+          minimum: 0
+          description: Maximum number of books user can borrow
+        currentBorrowedCount:
+          type: integer
+          minimum: 0
+          description: Number of books currently borrowed
+        createdAt:
+          type: string
+          format: date-time
+          description: Account creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    UserDetail:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            phoneNumber:
+              type: string
+              description: User's phone number
+            borrowedBooks:
+              type: array
+              items:
+                type: object
+                properties:
+                  bookId:
+                    type: string
+                  title:
+                    type: string
+                  borrowedAt:
+                    type: string
+                    format: date-time
+                  dueDate:
+                    type: string
+                    format: date-time
+
+    CreateUserRequest:
+      type: object
+      required:
+        - email
+        - name
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          description: User's email address
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: User's full name
+        password:
+          type: string
+          minLength: 8
+          description: User's password
+        phoneNumber:
+          type: string
+          description: User's phone number
+
+    Book:
+      type: object
+      required:
+        - id
+        - isbn
+        - title
+        - author
+        - genre
+        - publicationYear
+        - available
+        - totalCopies
+        - availableCopies
+      properties:
+        id:
+          type: string
+          pattern: '^bk_[a-zA-Z0-9]{6}$'
+          description: Unique book identifier
+        isbn:
+          type: string
+          pattern: '^978-[0-9]{1}-[0-9]{4}-[0-9]{4}-[0-9]{1}$'
+          description: International Standard Book Number
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Book title
+        author:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Book author
+        genre:
+          type: string
+          enum: [fiction, non-fiction, science, history, biography, children]
+          description: Book genre
+        publicationYear:
+          type: integer
+          minimum: 1000
+          maximum: 2100
+          description: Year of publication
+        publisher:
+          type: string
+          description: Publisher name
+        available:
+          type: boolean
+          description: Whether any copies are available
+        totalCopies:
+          type: integer
+          minimum: 0
+          description: Total number of copies
+        availableCopies:
+          type: integer
+          minimum: 0
+          description: Number of available copies
+
+    CreateBookRequest:
+      type: object
+      required:
+        - isbn
+        - title
+        - author
+        - genre
+        - publicationYear
+        - totalCopies
+      properties:
+        isbn:
+          type: string
+          pattern: '^978-[0-9]{1}-[0-9]{4}-[0-9]{4}-[0-9]{1}$'
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        author:
+          type: string
+          minLength: 1
+          maxLength: 100
+        genre:
+          type: string
+          enum: [fiction, non-fiction, science, history, biography, children]
+        publicationYear:
+          type: integer
+          minimum: 1000
+          maximum: 2100
+        publisher:
+          type: string
+        totalCopies:
+          type: integer
+          minimum: 1
+
+    BorrowBookRequest:
+      type: object
+      required:
+        - userId
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[a-zA-Z0-9]{6}$'
+          description: ID of the user borrowing the book
+        durationDays:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 14
+          description: Loan duration in days
+
+    ReturnBookRequest:
+      type: object
+      required:
+        - userId
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[a-zA-Z0-9]{6}$'
+          description: ID of the user returning the book
+
+    BorrowingRecord:
+      type: object
+      required:
+        - id
+        - userId
+        - bookId
+        - borrowedAt
+        - dueDate
+        - status
+      properties:
+        id:
+          type: string
+          pattern: '^brw_[a-zA-Z0-9]{6}$'
+          description: Unique borrowing record identifier
+        userId:
+          type: string
+          pattern: '^usr_[a-zA-Z0-9]{6}$'
+        bookId:
+          type: string
+          pattern: '^bk_[a-zA-Z0-9]{6}$'
+        borrowedAt:
+          type: string
+          format: date-time
+        dueDate:
+          type: string
+          format: date-time
+        returnedAt:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          type: string
+          enum: [active, returned, overdue]
+
+    Pagination:
+      type: object
+      required:
+        - page
+        - limit
+        - totalPages
+        - totalItems
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        totalPages:
+          type: integer
+          minimum: 0
+        totalItems:
+          type: integer
+          minimum: 0
+
+    Error:
+      type: object
+      required:
+        - error
+        - message
+        - timestamp
+      properties:
+        error:
+          type: string
+          description: Error code
+        message:
+          type: string
+          description: Human-readable error message
+        timestamp:
+          type: string
+          format: date-time
+          description: Error timestamp
+        details:
+          type: object
+          description: Additional error details
+
+  responses:
+    BadRequestError:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "BAD_REQUEST"
+            message: "Invalid request parameters"
+            timestamp: "2023-11-21T15:30:00Z"
+            details:
+              field: "email"
+              reason: "Invalid email format"
+
+    UnauthorizedError:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "UNAUTHORIZED"
+            message: "Missing or invalid API key"
+            timestamp: "2023-11-21T15:30:00Z"
+
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "NOT_FOUND"
+            message: "The requested resource was not found"
+            timestamp: "2023-11-21T15:30:00Z"
+
+    RateLimitError:
+      description: Too many requests
+      headers:
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "RATE_LIMIT_EXCEEDED"
+            message: "API rate limit exceeded"
+            timestamp: "2023-11-21T15:30:00Z"
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "INTERNAL_SERVER_ERROR"
+            message: "An unexpected error occurred"
+            timestamp: "2023-11-21T15:30:00Z"

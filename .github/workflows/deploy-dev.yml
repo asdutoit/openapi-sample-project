@@ -1,0 +1,169 @@
+name: Deploy to Development
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/openapi.yaml'
+      - 'src/**'
+      - 'infrastructure/**'
+      - '.github/workflows/deploy-dev.yml'
+  workflow_dispatch:
+    inputs:
+      deploy_reason:
+        description: 'Reason for manual deployment'
+        required: true
+        default: 'Manual deployment triggered'
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: dev
+  STACK_NAME: book-library-api-dev
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install validation tools
+        run: |
+          npm install -g @apidevtools/swagger-cli@4.0.4
+
+      - name: Validate OpenAPI spec
+        run: |
+          swagger-cli validate api/openapi.yaml
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: development
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install AWS SAM CLI
+        run: |
+          pip install aws-sam-cli
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Lambda dependencies
+        run: |
+          cd src/layers/nodejs
+          npm ci --production
+          cd ../../..
+
+      - name: Build SAM application
+        run: |
+          sam build \
+            --template-file infrastructure/template.yaml \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.DEV_API_KEY }}
+
+      - name: Deploy to AWS
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name ${{ env.STACK_NAME }} \
+            --s3-bucket ${{ secrets.SAM_DEPLOYMENT_BUCKET }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              ApiKeyValue=${{ secrets.DEV_API_KEY }} \
+              AllowedOrigins=${{ vars.DEV_ALLOWED_ORIGINS || '*' }} \
+              RateLimitPerMinute=${{ vars.DEV_RATE_LIMIT || '100' }}
+
+      - name: Get API endpoint
+        id: get-api-url
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text)
+          echo "API_URL=$API_URL" >> $GITHUB_OUTPUT
+          echo "API deployed to: $API_URL"
+
+      - name: Upload OpenAPI spec to S3 for documentation
+        run: |
+          DOCS_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`DocumentationBucket`].OutputValue' \
+            --output text)
+          
+          if [ ! -z "$DOCS_BUCKET" ]; then
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/openapi.yaml
+            aws s3 cp api/openapi.yaml s3://$DOCS_BUCKET/openapi-${{ github.sha }}.yaml
+          fi
+
+      - name: Run smoke tests
+        env:
+          API_ENDPOINT: ${{ steps.get-api-url.outputs.API_URL }}
+          API_KEY: ${{ secrets.DEV_API_KEY }}
+        run: |
+          # Test health endpoint if exists
+          curl -f -X GET "$API_ENDPOINT/health" \
+            -H "X-API-Key: $API_KEY" || echo "No health endpoint"
+          
+          # Test API is responding
+          curl -f -X GET "$API_ENDPOINT/users?limit=1" \
+            -H "X-API-Key: $API_KEY" \
+            -H "Accept: application/json" || exit 1
+
+      - name: Update deployment status
+        if: always()
+        run: |
+          STATUS="success"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="failure"
+          fi
+          
+          # Tag the deployment in CloudFormation
+          aws cloudformation update-stack \
+            --stack-name ${{ env.STACK_NAME }} \
+            --use-previous-template \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --tags \
+              Key=LastDeployment,Value=$(date -u +"%Y-%m-%d_%H-%M-%S") \
+              Key=DeploymentStatus,Value=$STATUS \
+              Key=GitCommit,Value=${{ github.sha }} \
+              Key=DeployedBy,Value=${{ github.actor }} || true
+
+      - name: Send deployment notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Development Deployment ${{ job.status }}
+            Environment: ${{ env.ENVIRONMENT }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+            API URL: ${{ steps.get-api-url.outputs.API_URL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

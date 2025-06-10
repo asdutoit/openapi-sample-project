@@ -1,0 +1,30 @@
+{
+  "dev": {
+    "Environment": "dev",
+    "AllowedOrigins": "*",
+    "RateLimitPerMinute": "100",
+    "EnableWAF": "false",
+    "EnableCustomDomain": "false",
+    "EnableXRay": "false"
+  },
+  "staging": {
+    "Environment": "staging",
+    "AllowedOrigins": "https://*.staging.booklibrary.com",
+    "RateLimitPerMinute": "200",
+    "EnableWAF": "true",
+    "EnableCustomDomain": "false",
+    "EnableXRay": "true",
+    "ReservedConcurrentExecutions": "50"
+  },
+  "production": {
+    "Environment": "production",
+    "AllowedOrigins": "https://booklibrary.com,https://www.booklibrary.com",
+    "RateLimitPerMinute": "1000",
+    "EnableWAF": "true",
+    "EnableCustomDomain": "true",
+    "CustomDomainName": "api.booklibrary.com",
+    "EnableXRay": "true",
+    "ReservedConcurrentExecutions": "100",
+    "ProvisionedConcurrentExecutions": "10"
+  }
+}
